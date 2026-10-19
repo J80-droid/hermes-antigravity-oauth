@@ -27,6 +27,7 @@ from client import (
     resolve_agy_command,
 )
 from process import _check_early_quota_error
+from stream import _is_output_limit_error, _result_reports_output_limit
 
 # Load the plugin's package entry as a real package (not a plain module) so its
 # `from .client import ...` relative imports resolve. Hermes itself discovers a
@@ -374,6 +375,73 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("[... large tool output truncated: 25008 chars ...]", d_prompt)
         self.assertIn("HEAD", d_prompt)
         self.assertIn("TAIL", d_prompt)
+
+    def test_format_messages_budget_preserves_latest_user_request_and_evicts_oldest(self):
+        messages: list[dict[str, object]] = [{"role": "user", "content": "Turn 1 initial modeling request"}]
+        for idx in range(40):
+            call_id = f"call_blender_{idx}"
+            messages.append({
+                "role": "assistant",
+                "content": f"Step {idx} reasoning",
+                "tool_calls": [{
+                    "id": call_id,
+                    "function": {
+                        "name": "mcp__blender__execute_blender_code",
+                        "arguments": json.dumps({"code": f"# script_{idx}\n" + ("A" * 6000)}),
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": f"done_{idx}",
+            })
+        messages.append({"role": "assistant", "content": "Turn 1 final summary: 79 meshes complete."})
+        latest_req = "Thanks, that works. Next, improve the material contrast on the remaining meshes first."
+        messages.append({"role": "user", "content": latest_req})
+
+        prompt = _format_messages_as_prompt(messages)
+        self.assertLessEqual(len(prompt), 150000)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 160000)
+        self.assertIn("### LATEST USER REQUEST TO ANSWER:", prompt)
+        self.assertIn(latest_req, prompt)
+        self.assertIn("Turn 1 final summary: 79 meshes complete.", prompt)
+        self.assertIn("truncated 60", prompt)
+
+        tight_prompt = _format_messages_as_prompt(messages, max_prompt_chars=40000, max_prompt_bytes=45000)
+        self.assertLessEqual(len(tight_prompt), 40000)
+        self.assertLessEqual(len(tight_prompt.encode("utf-8")), 45000)
+        self.assertIn("### LATEST USER REQUEST TO ANSWER:", tight_prompt)
+        self.assertIn(latest_req, tight_prompt)
+        self.assertIn("Turn 1 final summary: 79 meshes complete.", tight_prompt)
+        self.assertIn("earlier transcript messages omitted", tight_prompt)
+
+    def test_format_messages_budget_pins_active_user_request_on_mid_turn_tool_respawn(self):
+        active_user_req = "Improve the highlight and contrast of the remaining meshes first"
+        messages: list[dict[str, object]] = [
+            {"role": "user", "content": "Turn 1 old request"},
+            {"role": "assistant", "content": "Turn 1 done"},
+            {"role": "user", "content": active_user_req},
+        ]
+        for idx in range(15):
+            cid = f"call_t2_{idx}"
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": cid, "function": {"name": "exec", "arguments": json.dumps({"code": "B" * 4000})}}],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": cid,
+                "content": f"tool_out_{idx}_" + ("C" * 4000),
+            })
+
+        prompt = _format_messages_as_prompt(messages, max_prompt_chars=25000, max_prompt_bytes=28000)
+        self.assertLessEqual(len(prompt), 25000)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 28000)
+        self.assertIn(active_user_req, prompt)
+        self.assertIn("### LATEST TOOL RESULTS RECEIVED.", prompt)
+        self.assertIn("tool_out_14_", prompt)
 
     def test_mock_stream_tool_call_suppresses_trailing_hallucination(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
@@ -1244,6 +1312,105 @@ class AntigravityPluginTests(unittest.TestCase):
         proc.terminate.assert_called_once()
         client._worker_lock.release()
         client.close()
+
+    def test_worker_output_token_limit_error_is_length_finish(self):
+        # agy reports a reply cut at the output cap as a result "error".
+        # It must reach Hermes as finish_reason="length" (truncation
+        # recovery), not as a RuntimeError that Hermes misreads as a
+        # context overflow. The cut reply is not a resumable exchange: no
+        # history update, and the worker is retired.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        events = [
+            json.dumps({"event": "init", "conversation_id": "conv-output-cap"}),
+            json.dumps({"event": "step_update", "step_update": {"text_delta": "partial answer"}}),
+            json.dumps({
+                "event": "result",
+                "result": {
+                    "status": "ERROR",
+                    "error": "your previous response was cut off because it exceeded the output token limit",
+                },
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=True)
+
+        with patch("subprocess.Popen", return_value=proc), \
+                self._spy_update_worker_history(client) as history_spy:
+            stream = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=True,
+                timeout=30.0,
+            )
+            chunks = list(stream)
+
+        finish = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+        self.assertEqual(finish, ["length"])
+        text = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
+        self.assertEqual(text, "partial answer")
+        history_spy.assert_not_called()
+        self.assertIsNone(client._worker_proc)
+        proc.terminate.assert_called_once()
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_oneshot_output_token_limit_error_is_length_finish(self):
+        # Structured path: a max-tokens finish reason on the result event is
+        # enough even when the error text is not agy's truncation sentence.
+        tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        client = AntigravityClient(cwd=tmp_dir.name)
+        self.assertTrue(client._worker_lock.acquire(blocking=False))
+        events = [
+            json.dumps({"event": "init", "conversation_id": "oneshot-output-cap"}),
+            json.dumps({
+                "event": "result",
+                "result": {"status": "ERROR", "error": "generation stopped", "finish_reason": "MAX_TOKENS"},
+            }),
+        ]
+        proc = self._scripted_proc(events, alive=False)
+
+        with patch("subprocess.Popen", return_value=proc):
+            completion = client.chat.completions.create(
+                model="gemini-3.8-flash-high",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+                timeout=30.0,
+            )
+
+        self.assertEqual(completion.choices[0].finish_reason, "length")
+        client._worker_lock.release()
+        client.close()
+
+    def test_output_limit_detection_matches_agy_sentences_only(self):
+        for text in (
+            "Your previous response was cut off because it exceeded the output token limit",
+            "your response exceeded the maximum output token limit and was truncated. Do not repeat...",
+            "Your previous response was cut off\nbecause it exceeded the output token limit.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_is_output_limit_error(text))
+        # Same phrase, unrelated agy auxiliary messages: not a response truncation.
+        for text in (
+            "Checkpoint summary exceeded the max output token limit of 8192",
+            "intent prediction exceeded the max output token limit of 1024",
+            "exceeded the output token limit",
+            "", None, 42,
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(_is_output_limit_error(text))
+        for result in (
+            {"finish_reason": "MAX_TOKENS"}, {"finishReason": "max_tokens"},
+            {"stop_reason": "max_tokens"}, {"metadata": {"finishReason": "length"}},
+        ):
+            with self.subTest(result=result):
+                self.assertTrue(_result_reports_output_limit(result))
+        for result in (
+            {}, {"finish_reason": "STOP"}, {"finish_reason": None}, {"metadata": "MAX_TOKENS"},
+            {"status": "ERROR", "error": "context canceled"}, None, "MAX_TOKENS",
+        ):
+            with self.subTest(result=result):
+                self.assertFalse(_result_reports_output_limit(result))
 
     def test_worker_eof_without_result_event_is_not_success(self):
         # The dead-worker guard's blind spot: the worker exited 0, so

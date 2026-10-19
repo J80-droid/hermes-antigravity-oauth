@@ -11,10 +11,14 @@ import logging
 import os
 import re
 import subprocess
-from typing import Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 from providers import register_provider
 from providers.base import ProviderProfile
+
+if TYPE_CHECKING:
+    from agent.account_usage import AccountUsageSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -96,16 +100,28 @@ class AntigravityOAuthProfile(ProviderProfile):
         model: str | None = None,
         **context: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Forward only supported separate effort flags for manual Gemini requests."""
+        """Project the session for live reasoning; forward effort only when agy accepts it.
+
+        The separate CLI effort flag is valid only for manual suffixless Gemini
+        requests. The session projection is independent of the model.
+        """
+        top_level: dict[str, Any] = {}
+        session_id = context.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            from .live_reasoning import ensure_registered
+            ensure_registered()
+            top_level["_agy_session_id"] = session_id
         if not supports_effort_flag(model):
-            return {}, {}
+            return {}, top_level
         effort = None
         if isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
                 effort = "low"
             else:
                 effort = _normalize_effort(reasoning_config.get("effort"))
-        return {}, {"reasoning_effort": effort} if effort else {}
+        if effort:
+            top_level["reasoning_effort"] = effort
+        return {}, top_level
 
     def fetch_models(
         self,
@@ -143,6 +159,36 @@ class AntigravityOAuthProfile(ProviderProfile):
             logger.debug("Antigravity fetch_models failed: %s", exc)
 
         return None
+
+    def fetch_account_usage(
+        self, *, base_url: str | None = None, api_key: str | None = None
+    ) -> AccountUsageSnapshot | None:
+        """`/usage` hook: weekly quota windows reported by `agy -p /usage`, or None."""
+        try:
+            from .usage import fetch_usage_report
+        except ImportError:  # flat source tree under test
+            from usage import fetch_usage_report
+
+        report = fetch_usage_report()
+        if report is None:
+            return None
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+
+        return AccountUsageSnapshot(
+            provider=self.name,
+            source="agy_usage",
+            fetched_at=datetime.now(timezone.utc),
+            windows=tuple(
+                AccountUsageWindow(
+                    label=window.label,
+                    used_percent=window.used_percent,
+                    reset_at=window.reset_at,
+                    detail=window.detail,
+                )
+                for window in report.windows
+            ),
+            raw=report.raw,
+        )
 
     def get_model_context_length(self, model: str) -> int | None:
         """Defer to Hermes-native metadata unless a positive override is set.
@@ -239,3 +285,9 @@ antigravity_profile = AntigravityOAuthProfile(
 )
 
 register_provider(antigravity_profile)
+
+
+def register(ctx):
+    """Optional general-plugin lifecycle entry point (provider discovery skips it)."""
+    from .live_reasoning import register as register_reasoning
+    return register_reasoning(ctx)

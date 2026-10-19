@@ -20,6 +20,12 @@ hermes --provider antigravity-oauth -m '<exact-model-id>'
 - **What it does touch (disclosure):** each agy process runs in a private temp HOME. To let agy reuse its own login there, the plugin symlinks agy's `antigravity-oauth-token` file into that HOME, and on macOS it symlinks `~/Library/Keychains`. Before spawning, it checks the OS keyring for the credential's existence only (`security` / `secret-tool` / `cmdkey`) and never reads the secret. The temp HOME is deleted when the session closes.
 - **Your Hermes SOUL.md is the persona.** Each turn, the plugin writes Hermes' system prompt into agy's private workspace as `GEMINI.md`, which agy loads as first-class rules. That prompt starts with `$HERMES_HOME/SOUL.md`, and the file is added directly if Hermes left it out.
 - **Hermes runs the tools.** agy's built-in tools never execute on your host. When a model calls one anyway, the plugin re-issues it as the matching Hermes tool: `run_command`→`terminal`, `view_file`→`read_file`, `grep_search`/`find_by_name`→`search_files`, `write_to_file`→`write_file`, `search_web`→`web_search`, `read_url_content`→`web_extract`. It then runs under Hermes' approvals and sandbox. Any other native tool is blocked.
+- **`/usage` asks agy for your quota.** `/usage` and `hermes usage` run `agy --version` and then `agy -p /usage --output-format json`, which answers from agy's own session without a model turn. You get one row per quota group, such as `Gemini 7d` and `Claude/GPT 7d`. It only runs when agy is signed in, from a temp folder with your normal HOME and agy's auto-updater turned off.
+
+## Limitations
+
+- `/usage` needs agy 1.1.11 or newer. On older versions it shows nothing.
+- On Windows, a hung `/usage` call is cleaned up through Hermes' process helper (Hermes 0.21.4 or newer, with psutil installed), which kills everything agy started. Without it, a process agy started can keep running in the background.
 
 ## Install
 
@@ -101,6 +107,42 @@ example, `gpt-oss-120b-medium` is currently unresolved by the native resolver.
 That fallback is **unknown metadata, not native model capacity**. If necessary,
 set an explicit conservative budget for your route. This change does not establish
 million-token account acceptance; serving limits require separate live testing.
+
+## Live reasoning on non-streaming Hermes turns
+
+`external_process` authentication remains unchanged: Hermes selects its normal
+non-streaming path. For foreground agents with an installed reasoning callback
+and a text-stream consumer, the plugin's collector forwards available reasoning
+while it assembles the response. It calls the existing callback, preserving the
+TUI's show/hide and notification-mute gates. Reasoning remains separate from
+answer/tool content and is never added to the replay prompt.
+
+The profile's main-request projection installs `llm_execution` middleware using
+`PluginContext.register_middleware`. This explicit bootstrap is necessary because
+Hermes' provider discovery imports model-provider plugins but skips their general
+`register(ctx)` lifecycle. Registration is profile-local, idempotent, and uses an
+unloadable host registration handle. Auxiliary projections carry no session ID.
+
+A context-local, single-collector lease fences delivery by profile, provider,
+model, session, turn, request, current callback identity and client liveness.
+Cancellation, closing sessions, request replacement and middleware exit disable
+late delivery. Missing host compatibility seams disable only the optional live
+presentation; completed reasoning and usage remain available. Streaming callers
+continue to receive ordinary chunks, with no extra callback delivery.
+
+This uses read-only host internals for current-agent/session lookup; compatibility
+is tested against the installed Hermes checkout, not guaranteed for all releases.
+Already running processes retain their previously loaded plugin code; this plugin
+does not hot-patch them. No daemon restart or configuration change is performed.
+Agy may return no thinking text even when a request otherwise succeeds. Live
+history restoration and actual frontend rendering are separate from delivery.
+
+The opt-in `scripts/verify_live_reasoning.py` makes one bounded, tool-free call to
+bare `gemini-4-argon` using the existing account. It exercises real AIAgent kwargs,
+the unchanged `_should_stream=False` decision, middleware, the nonstream worker,
+agy/DB reader, collector, and installed TUI reasoning callback. Only UI egress is
+captured; it does not prove display in an existing desktop window. Its receipt
+records counts/times, never reasoning text. See `VERIFICATION.md`.
 
 ## Development
 

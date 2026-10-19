@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import queue
 import subprocess
 import threading
 import time
@@ -23,6 +24,54 @@ except ImportError:
     import native_tools as _native_tools
 
 logger = logging.getLogger(__name__)
+
+# agy reports a reply cut off at the model's output cap as a result "error".
+# That is an output truncation, not a failed request: surfacing it as a
+# RuntimeError made Hermes read "token limit" as a context overflow and print
+# the wrong recovery advice. It is mapped to finish_reason="length" so Hermes'
+# truncation recovery handles it.
+#
+# Detection order: a structured finish/stop reason on the result event when
+# agy provides one, then the exact response-truncation sentences embedded in
+# the agy binary. The sentences are matched whole, not by the loose phrase
+# "output token limit": agy uses that phrase in unrelated auxiliary messages
+# too ("Checkpoint summary exceeded the max output token limit of %d",
+# "intent prediction exceeded the max output token limit of %d").
+_OUTPUT_LIMIT_REASON_KEYS = ("finish_reason", "finishReason", "stop_reason", "stopReason")
+_OUTPUT_LIMIT_REASONS = frozenset({"max_tokens", "max_output_tokens", "length"})
+_OUTPUT_LIMIT_MARKERS = (
+    "your previous response was cut off because it exceeded the output token limit",
+    "your response exceeded the maximum output token limit and was truncated",
+)
+
+
+def _is_output_limit_error(error_msg: Any) -> bool:
+    """True when ``error_msg`` is agy's response-truncation error text."""
+    if not isinstance(error_msg, str):
+        return False
+    lowered = " ".join(error_msg.lower().split())
+    return any(marker in lowered for marker in _OUTPUT_LIMIT_MARKERS)
+
+
+def _result_reports_output_limit(result: Any) -> bool:
+    """True when the agy result event carries a structured max-tokens reason.
+
+    Checked on the result itself and on its ``metadata`` mapping, under the
+    common Gemini/OpenAI/Anthropic key spellings. Absent keys are not a signal
+    either way; the error text check remains the fallback.
+    """
+    if not isinstance(result, dict):
+        return False
+    sources = [result]
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+    for source in sources:
+        for key in _OUTPUT_LIMIT_REASON_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip().lower() in _OUTPUT_LIMIT_REASONS:
+                return True
+    return False
 
 
 class _UsageDeltas(NamedTuple):
@@ -148,6 +197,7 @@ class AntigravityStream(Iterator[Any]):
         worker_lock_held: bool | None = None,
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
+        thinking_reader: Any = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -164,6 +214,10 @@ class AntigravityStream(Iterator[Any]):
                 "that acquired it must carry the ownership flag so its "
                 "cleanup can release it."
             )
+        self._thinking_reader = thinking_reader
+        self._reader_stop = threading.Event()
+        self._reader_thread = None
+        self._thinking_next_poll = 0.0
         self.proc = proc
         self.client = client
         self.model = model
@@ -186,7 +240,8 @@ class AntigravityStream(Iterator[Any]):
         # Cumulative usage snapshot of the worker session that owns this
         # stream; only worker streams receive one (see client._create_chat_completion).
         self.usage_baseline = usage_baseline
-        self.conversation_id = ""
+        prior_id = getattr(client, "_worker_conversation_id", "") if is_worker else ""
+        self.conversation_id = prior_id if isinstance(prior_id, str) else ""
         self._closed = False
         self._interrupted = False
         self._finished = False
@@ -324,21 +379,10 @@ class AntigravityStream(Iterator[Any]):
         not per-request, non-blocking is the best a plugin can do without a
         Hermes hook that would hand out a coroutine from create().
 
-        Cancelling an in-flight ``__anext__`` (e.g. a ``wait_for`` timeout)
-        leaves the stream unclosed: the worker lock stays held, the worker
-        process stays alive, and the private executor's worker stays blocked
-        in ``readline()`` until something calls ``close()``. Hermes' own
-        ``_aggregate_chat_stream_async`` supplies that ``close()`` on
-        realistic paths -- its ``finally`` runs ``_close_chunk_stream(chunks,
-        allow_aclose=True)``, which finds this class's sync ``close()`` --
-        matching the sync behavior of abandoning a stream without calling
-        ``close()``. No ``CancelledError`` handler is added here on purpose:
-        reacting to cancellation would change the close/terminate semantics,
-        which is out of scope for this fix. A stream neither consumed nor
-        closed keeps its executor thread (non-daemon, like every
-        ThreadPoolExecutor thread) blocked until the process exits; the same
-        is true of an abandoned sync stream's subprocess, and closing the
-        client terminates the child, unblocking the read.
+        Cancelling an in-flight ``__anext__`` closes the stream, terminates
+        its worker, and releases its request lock. The DB timer stops and the
+        stdout reader unblocks when the child exits. Explicit close() remains
+        required for a sync stream abandoned before completion.
         """
         if self._closed:
             raise StopAsyncIteration
@@ -347,9 +391,13 @@ class AntigravityStream(Iterator[Any]):
             executor = self._async_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="agy-stream"
             )
-        stream_exhausted, chunk = await asyncio.get_running_loop().run_in_executor(
-            executor, self._pull_chunk
-        )
+        try:
+            stream_exhausted, chunk = await asyncio.get_running_loop().run_in_executor(
+                executor, self._pull_chunk
+            )
+        except asyncio.CancelledError:
+            self.close()
+            raise
         if stream_exhausted:
             raise StopAsyncIteration
         return chunk
@@ -373,6 +421,7 @@ class AntigravityStream(Iterator[Any]):
         if self._closed:
             return
         self._closed = True
+        self._stop_optional_readers()
         if self.is_worker:
             # Terminate the worker only if it is still OURS. The interrupted
             # path runs at an arbitrary later time on an arbitrary thread --
@@ -394,6 +443,63 @@ class AntigravityStream(Iterator[Any]):
         # _retire_executor); a second call is a harmless no-op because an
         # already-shut-down executor accepts shutdown() again.
         self._retire_executor()
+        self._join_stdout_reader()
+
+    def _stop_optional_readers(self) -> None:
+        self._reader_stop.set()
+        if self._thinking_reader is not None:
+            self._thinking_reader.close()
+
+    def _join_stdout_reader(self) -> None:
+        thread = self._reader_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.3)
+
+    def _read_line(self, deadline: float) -> str | None:
+        """Multiplex stdout with the DB timer, without extra DB watcher threads.
+
+        A turn-scoped reader stops AT result (before another blocking read),
+        leaving persistent-worker stdout available to the next turn. Cancel/
+        timeout terminates the child via close(), unblocking the single reader.
+        StringIO and other scripted test streams use the identical queue path.
+        """
+        if self._reader_thread is None:
+            self._stdout_queue = queue.Queue(maxsize=64)
+
+            def read_stdout():
+                try:
+                    while not self._reader_stop.is_set():
+                        line = self.proc.stdout.readline() if self.proc.stdout else ""
+                        while not self._reader_stop.is_set():
+                            try:
+                                self._stdout_queue.put(line, timeout=0.05)
+                                break
+                            except queue.Full:
+                                continue
+                        if not line:
+                            return
+                        try:
+                            if json.loads(line).get("event") == "result":
+                                return
+                        except (ValueError, AttributeError):
+                            continue
+                except Exception as exc:
+                    while not self._reader_stop.is_set():
+                        try:
+                            self._stdout_queue.put(exc, timeout=0.05)
+                            return
+                        except queue.Full:
+                            continue
+
+            self._reader_thread = threading.Thread(target=read_stdout, name="agy-stream-stdout-turn", daemon=True)
+            self._reader_thread.start()
+        try:
+            item = self._stdout_queue.get(timeout=max(0.001, min(0.1, deadline - time.monotonic())))
+        except queue.Empty:
+            return None
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def _make_chunk(
         self,
@@ -401,13 +507,14 @@ class AntigravityStream(Iterator[Any]):
         content: str | None = None,
         tool_calls: list[Any] | None = None,
         finish_reason: str | None = None,
+        reasoning_content: str | None = None,
     ) -> Any:
         delta = SimpleNamespace(
             role="assistant",
             content=content,
             tool_calls=tool_calls,
             reasoning=None,
-            reasoning_content=None,
+            reasoning_content=reasoning_content,
         )
         choice = SimpleNamespace(
             index=0,
@@ -499,6 +606,8 @@ class AntigravityStream(Iterator[Any]):
         saw_result = False
         neutralized_tool_step = False
         success = False
+        # agy cut the reply at the output cap (see _is_output_limit_error).
+        output_truncated = False
         start_time = time.monotonic()
 
         gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
@@ -532,15 +641,25 @@ class AntigravityStream(Iterator[Any]):
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
-                line = self.proc.stdout.readline() if self.proc.stdout else ""
+                line = self._read_line(deadline)
+                if self._closed:
+                    break
+                if self._thinking_reader is not None and time.monotonic() >= self._thinking_next_poll:
+                    self._thinking_next_poll = time.monotonic() + 0.1
+                    for thinking_delta in self._thinking_reader.poll(self.conversation_id):
+                        yield self._make_chunk(reasoning_content=thinking_delta)
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
-                if not line:
-                    if self.proc.poll() is not None:
-                        break
-                    time.sleep(0.01)
+                if line is None:
+                    # Idle poll slice: no stdout yet, loop to service the
+                    # thinking reader and early-error checks.
                     continue
+                if not line:
+                    # `_read_line` returns an empty string exclusively on EOF of the
+                    # reader thread's blocking `readline()`; no `proc.poll()` or
+                    # `time.sleep()` needed.
+                    break
 
                 line = line.strip()
                 if not line.startswith("{"):
@@ -592,6 +711,17 @@ class AntigravityStream(Iterator[Any]):
                         break
                     if "usage" in step:
                         usage_data = step["usage"]
+
+                    # Display-only metadata: never merge thinking into answer/tool text.
+                    # The stream's own thinking_delta is authoritative; the DB
+                    # sidechannel exists only for models/agy versions that do not
+                    # emit it. Once the stream carries thinking, stop the DB poll so
+                    # the same reasoning is not delivered twice.
+                    thinking_delta = step.get("thinking_delta")
+                    if isinstance(thinking_delta, str) and thinking_delta:
+                        if self._thinking_reader is not None and not self._thinking_reader.closed:
+                            self._thinking_reader.close()
+                        yield self._make_chunk(reasoning_content=thinking_delta)
 
                     text_delta = step.get("text_delta")
                     if text_delta:
@@ -651,6 +781,10 @@ class AntigravityStream(Iterator[Any]):
                         usage_data = res["usage"]
                     if "error" in res:
                         error_msg = res["error"]
+                    if _result_reports_output_limit(res) or _is_output_limit_error(error_msg):
+                        logger.warning("Antigravity reply hit the output token limit: %s", error_msg or res.get("status", ""))
+                        output_truncated = True
+                        error_msg = ""
                     saw_result = True
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.
@@ -683,10 +817,13 @@ class AntigravityStream(Iterator[Any]):
                     success = (
                         status == "SUCCESS"
                         and not error_msg
+                        and not output_truncated
                         and bool(has_content or has_tool_calls or text_buffer or final_resp)
                     )
                     break
 
+            self._stop_optional_readers()
+            self._join_stdout_reader()
             if text_buffer and not has_tool_calls:
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
@@ -756,7 +893,7 @@ class AntigravityStream(Iterator[Any]):
                 # SUCCESS result is unverified -- and mirrored in the success
                 # verdict above, so this failed turn can never reach the
                 # worker-history update.
-                if error_msg or status == "ERROR":
+                if not output_truncated and (error_msg or status == "ERROR"):
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 # `not in (None, 0)`, not `!= 0`: with the raw poll() above,
@@ -789,7 +926,7 @@ class AntigravityStream(Iterator[Any]):
                 # cannot be retracted -- Hermes aggregates a stream that
                 # raises mid-way, so failing the turn is the only honest
                 # outcome.
-                if not neutralized_tool_step and not success:
+                if not neutralized_tool_step and not success and not output_truncated:
                     raise RuntimeError(
                         "Antigravity execution failed: "
                         + self._empty_result_message(
@@ -817,7 +954,7 @@ class AntigravityStream(Iterator[Any]):
                 # so this failed turn can never reach the worker-history
                 # update; the deltas already yielded cannot be retracted --
                 # Hermes aggregates a stream that raises mid-way.
-                if error_msg or status == "ERROR":
+                if not output_truncated and (error_msg or status == "ERROR"):
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
                 worker_exit = self.proc.poll()
@@ -882,7 +1019,7 @@ class AntigravityStream(Iterator[Any]):
                 # cannot be retracted -- Hermes aggregates a stream that
                 # raises mid-way -- so the turn fails, and the finally's
                 # close() terminates the worker that broke it.
-                if not neutralized_tool_step and not success:
+                if not neutralized_tool_step and not success and not output_truncated:
                     raise RuntimeError(
                         "Antigravity execution failed: "
                         + self._empty_result_message(
@@ -893,7 +1030,10 @@ class AntigravityStream(Iterator[Any]):
                         )
                     )
 
-            finish_reason = "tool_calls" if has_tool_calls else "stop"
+            if output_truncated:
+                finish_reason = "length"
+            else:
+                finish_reason = "tool_calls" if has_tool_calls else "stop"
 
             # Resolve usage (advancing the cumulative worker baseline) BEFORE
             # emitting the finish-reason chunk. The common client pattern
@@ -905,6 +1045,14 @@ class AntigravityStream(Iterator[Any]):
             # absorbs them. There is no yield between this computation and
             # the finish-reason yield, so chunk emission order is unchanged.
             input_tokens, output_tokens, total_tokens, cached_tokens = self._usage_totals(usage_data)
+            # Keep agy's output/total counters unchanged: thinking is a separate
+            # reported breakdown, not an inferred surcharge on the total.
+            thinking_tokens = None
+            if "thinking_tokens" in usage_data:
+                if self.is_worker and self.usage_baseline is not None:
+                    thinking_tokens = _counter_delta(usage_data, self.usage_baseline, "thinking_tokens")
+                elif usage_data["thinking_tokens"] is not None:
+                    thinking_tokens = int(usage_data["thinking_tokens"])
 
             yield self._make_chunk(finish_reason=finish_reason)
 
@@ -912,6 +1060,10 @@ class AntigravityStream(Iterator[Any]):
                 prompt_tokens=input_tokens,
                 completion_tokens=output_tokens,
                 total_tokens=total_tokens,
+                completion_tokens_details=(
+                    SimpleNamespace(reasoning_tokens=thinking_tokens)
+                    if thinking_tokens is not None else None
+                ),
                 prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
             )
             yield SimpleNamespace(
@@ -941,11 +1093,20 @@ class AntigravityStream(Iterator[Any]):
             success = False
             raise
         finally:
+            self._stop_optional_readers()
             watchdog_stop.set()
             if watchdog_thread and watchdog_thread.is_alive():
                 watchdog_thread.join(timeout=0.2)
             if self.is_worker:
+                if output_truncated and not success and self.proc is self.client._worker_proc:
+                    # The truncated reply is not a usable exchange to resume
+                    # from, and close() leaves a _finished worker alive:
+                    # retire it explicitly so the next turn respawns with the
+                    # full history Hermes sends.
+                    self.client._terminate_worker()
                 if success and not self._interrupted:
+                    if self.proc is self.client._worker_proc:
+                        self.client._worker_conversation_id = self.conversation_id
                     self.client._update_worker_history(self.messages)
                     self._release_worker_lock_once()
                 else:
@@ -954,7 +1115,7 @@ class AntigravityStream(Iterator[Any]):
                 self.close()
 
 
-def collect_stream_completion(stream: AntigravityStream) -> Any:
+def collect_stream_completion(stream: AntigravityStream, *, reasoning_emitter=None) -> Any:
     """Consume an AntigravityStream completely and assemble a non-streaming ChatCompletion object.
 
     The returned object is a :class:`_AwaitableCompletion`: identical in shape
@@ -965,6 +1126,7 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
     conversation_id = ""
     model = stream.model
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[Any] = []
     finish_reason: str | None = None
     usage: Any = None
@@ -982,6 +1144,13 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
                 finish_reason = choice.finish_reason
             delta = getattr(choice, "delta", None)
             if delta:
+                if getattr(delta, "reasoning_content", None):
+                    reasoning_parts.append(delta.reasoning_content)
+                    if reasoning_emitter is not None:
+                        try:
+                            reasoning_emitter(delta.reasoning_content)
+                        except Exception:
+                            reasoning_emitter = None  # optional UI cannot break collection
                 if getattr(delta, "content", None):
                     content_parts.append(delta.content)
                 if getattr(delta, "tool_calls", None):
@@ -1012,7 +1181,7 @@ def collect_stream_completion(stream: AntigravityStream) -> Any:
         content=full_content,
         tool_calls=tool_calls if tool_calls else None,
         reasoning=None,
-        reasoning_content=None,
+        reasoning_content="".join(reasoning_parts) or None,
         reasoning_details=None,
     )
     choice = SimpleNamespace(

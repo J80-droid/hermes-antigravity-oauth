@@ -49,6 +49,7 @@ try:
         _parse_tool_block,
         _render_message_content,
     )
+    from .thinking import ThinkingReader
     from .stream import AntigravityStream, collect_stream_completion
     from . import soul as _soul
 except ImportError:
@@ -79,6 +80,7 @@ except ImportError:
         _parse_tool_block,
         _render_message_content,
     )
+    from thinking import ThinkingReader
     from stream import AntigravityStream, collect_stream_completion
     import soul as _soul
 
@@ -294,6 +296,7 @@ class AntigravityClient:
         # out of the locked region would trade the deadlock for races.
         self._lock = threading.RLock()
         self._worker_proc: subprocess.Popen | None = None
+        self._worker_conversation_id = ""
         self._worker_model: str | None = None
         self._worker_effort: str | None = None
         self._worker_history: list[dict[str, Any]] = []
@@ -432,6 +435,7 @@ class AntigravityClient:
         if self._worker_proc is not None:
             proc = self._worker_proc
             self._worker_proc = None
+            self._worker_conversation_id = ""
             self._worker_model = None
             self._worker_effort = None
             self._worker_history = []
@@ -502,6 +506,7 @@ class AntigravityClient:
                 **_own_process_group(),
             )
             self._worker_proc = proc
+            self._worker_conversation_id = ""
             self._worker_model = model
             self._worker_effort = effort
             self._worker_history = []
@@ -519,6 +524,7 @@ class AntigravityClient:
         tools: list[dict[str, Any]] | None,
         tool_choice: Any,
         stream: bool,
+        reasoning_emitter=None,
     ) -> Any:
         rules = self._sync_workspace_rules(messages)
         prompt_text = _format_messages_as_prompt(
@@ -544,6 +550,7 @@ class AntigravityClient:
             **_own_process_group(),
         )
 
+        thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
         try:
             if proc.stdin:
                 proc.stdin.write(prompt_text + "\n")
@@ -562,10 +569,11 @@ class AntigravityClient:
             timeout=timeout,
             tools=tools,
             is_worker=False,
+            thinking_reader=thinking_reader,
         )
         if stream:
             return stream_iter
-        return collect_stream_completion(stream_iter)
+        return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
 
     def _create_chat_completion(
         self,
@@ -591,6 +599,15 @@ class AntigravityClient:
         effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
         resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
         messages_list = list(messages or [])
+        reasoning_emitter = None
+        if not stream:
+            try:
+                from .live_reasoning import collector_emitter
+            except ImportError:
+                from live_reasoning import collector_emitter
+            reasoning_emitter = collector_emitter(
+                extra_kwargs.get("_agy_session_id"), extra_kwargs.get("_agy_request_token"), client=self
+            )
         effective_timeout = (
             float(timeout)
             if isinstance(timeout, (int, float)) and timeout > 0
@@ -617,6 +634,7 @@ class AntigravityClient:
                         rules_in_workspace=rules,
                     )
 
+                thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
                 event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
                     proc.stdin.write(json.dumps(event_msg) + "\n")
@@ -628,6 +646,8 @@ class AntigravityClient:
                         messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice,
                         rules_in_workspace=rules,
                     )
+                    thinking_reader.close()
+                    thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
                     event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
@@ -645,11 +665,12 @@ class AntigravityClient:
                     worker_lock_held=worker_acquired,
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
+                    thinking_reader=thinking_reader,
                 )
                 if stream:
                     return stream_iter
                 try:
-                    return collect_stream_completion(stream_iter)
+                    return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
                 finally:
                     if self._worker_lock.locked():
                         self._worker_lock.release()
@@ -667,4 +688,5 @@ class AntigravityClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 stream=stream,
+                reasoning_emitter=reasoning_emitter,
             )
