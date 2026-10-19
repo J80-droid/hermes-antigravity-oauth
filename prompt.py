@@ -28,11 +28,6 @@ _PROMPT_PREAMBLE = (
     "- If no tool is needed, respond naturally with standard text.",
 )
 
-_TOOL_CALL_PREFIXES = tuple(
-    "<tool_call>"[:i] for i in range(len("<tool_call>"), 0, -1)
-)
-
-
 def _render_message_content(content: Any) -> str:
     """Normalize multimodal or structured message content into a string."""
     if content is None:
@@ -262,10 +257,16 @@ def _format_delta_prompt(new_messages: Sequence[dict[str, Any]]) -> str:
 
 
 def _longest_tool_call_prefix_match(text: str) -> int:
-    """Return the length of the longest suffix of `text` that matches a prefix of `<tool_call>`."""
-    for prefix in _TOOL_CALL_PREFIXES:
-        if text.endswith(prefix):
-            return len(prefix)
+    """Return the length of the longest suffix of `text` that matches a prefix of `<tool_call>`.
+
+    Optimized to find the last '<' rather than looping through all prefixes.
+    """
+    idx = text.rfind('<')
+    if idx == -1:
+        return 0
+    suffix_len = len(text) - idx
+    if suffix_len <= 11 and "<tool_call>".startswith(text[idx:]):
+        return suffix_len
     return 0
 
 
