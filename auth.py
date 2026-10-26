@@ -40,8 +40,12 @@ def login_command(agy: str) -> list[str]:
 def verify_session(agy: str, timeout: float = _VERIFY_TIMEOUT_S) -> tuple[bool, list[str], str]:
     """Live check: `agy models` only succeeds for a signed-in account. Returns (ok, model_ids, detail)."""
     try:
+        try:
+            from .process import hidden_console_kwargs
+        except ImportError:
+            from process import hidden_console_kwargs
         res = subprocess.run([agy, "models"], capture_output=True, text=True, timeout=timeout,
-                             stdin=subprocess.DEVNULL, check=False)
+                             stdin=subprocess.DEVNULL, check=False, **hidden_console_kwargs())
     except subprocess.TimeoutExpired:
         return False, [], f"`agy models` timed out after {timeout:.0f}s"
     except OSError as exc:

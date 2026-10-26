@@ -84,6 +84,22 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _hide_spawned_consoles() -> None:
+    """Keep later console programs (agy, and the terminal tool) from flashing a window."""
+    try:
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "surplus-llm" / "console_hide.py"
+        spec = importlib.util.spec_from_file_location("surplus_llm_console_hide", path)
+        if spec is None or spec.loader is None:
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.install_hidden_console()
+    except Exception:
+        logger.warning("Antigravity: console hide not installed", exc_info=True)
+
 _DEFAULT_TIMEOUT_SECONDS = 300.0
 
 # Issue #4 (Windows, WinError 32): terminating agy's process tree
@@ -482,6 +498,7 @@ class AntigravityClient:
 
             self._terminate_worker_locked()
 
+            _hide_spawned_consoles()
             cmd_args = [self._command, "--input-format", "stream-json", *self._args]
             if model:
                 cmd_args.extend(["--model", model])
@@ -524,6 +541,7 @@ class AntigravityClient:
         prompt_text = _format_messages_as_prompt(
             messages, model=model, tools=tools, tool_choice=tool_choice, rules_in_workspace=rules
         )
+        _hide_spawned_consoles()
         cmd_args = [self._command, *self._args]
         if model:
             cmd_args.extend(["--model", model])

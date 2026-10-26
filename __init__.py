@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 _FALLBACK_MODELS = (
     "gemini-3.8-flash",
+    "gemini-4-argon",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.1-pro",
@@ -106,11 +107,17 @@ class AntigravityOAuthProfile(ProviderProfile):
 
         cmd = resolve_agy_command()
         try:
+            from .process import hidden_console_kwargs
+        except ImportError:
+            from process import hidden_console_kwargs
+        try:
             res = subprocess.run(
                 [cmd, "models"],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                stdin=subprocess.DEVNULL,
+                **hidden_console_kwargs(),
             )
             raw_models: list[str] = []
             for raw_line in res.stdout.strip().splitlines():

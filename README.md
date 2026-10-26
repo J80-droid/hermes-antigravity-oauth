@@ -5,7 +5,7 @@
 [![provenance](https://img.shields.io/badge/npm-provenance-blue)](https://www.npmjs.com/package/hermes-antigravity-oauth#provenance)
 [![license](https://img.shields.io/github/license/neerazz/hermes-antigravity-oauth)](LICENSE)
 
-Run [Hermes Agent](https://hermes-agent.nousresearch.com) on your Google Antigravity plan (Gemini 3.x, Claude 4.6, GPT-OSS) with a single sign-in.
+Run [Hermes Agent](https://hermes-agent.nousresearch.com) on your Google Antigravity plan (Gemini, including Gemini 4 Argon, Claude, and GPT-OSS) with a single sign-in.
 
 ```bash
 npx hermes-antigravity-oauth          # install + enable the plugin, then sign in
@@ -48,7 +48,9 @@ Aliases: `google-antigravity`, `agy-oauth`.
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the agy binary |
 | `ANTIGRAVITY_WORKSPACE_RULES` | `1` | `0` puts SOUL/system prompt inline in the prompt instead of `GEMINI.md` |
 
-Claude and GPT-OSS models get no `--effort` flag because agy rejects it for them. Gemini models accept the `-low/-medium/-high` suffixes.
+Claude and GPT-OSS models get no `--effort` flag because agy rejects it for them. Gemini models are sent with an effort suffix. `agy models` lists Gemini 4 Argon only as `gemini-4-argon-low`, `gemini-4-argon-medium` and `gemini-4-argon-high`. Choosing Argon therefore calls one of those three ids. The bare id `gemini-4-argon` is not a model agy accepts, and leaving it bare made the turn run as `gemini-3.8-flash`.
+
+On Windows, a short helper such as `agy models` or `cmdkey` inherits the gateway's hidden console. Detaching it with `CREATE_NO_WINDOW` flashes a command window for one frame. A process that has no console of its own still starts hidden.
 
 ## Development
 

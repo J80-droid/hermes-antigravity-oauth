@@ -41,10 +41,63 @@ def _is_existing_file(path: str | Path) -> bool:
         return False
 
 
+_console_hide = None
+
+
+def _load_console_hide():
+    """The surplus-llm helper that inherits a hidden console or hides a new one."""
+    global _console_hide
+    if _console_hide is not None:
+        return _console_hide
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "surplus-llm" / "console_hide.py"
+    spec = importlib.util.spec_from_file_location("surplus_llm_console_hide", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _console_hide = module
+    return module
+
+
+def hidden_console_kwargs() -> dict[str, Any]:
+    """Keep a short console program (agy, cmdkey) from opening a window.
+
+    The desktop gateway already owns a hidden console. The child has to
+    inherit it. CREATE_NO_WINDOW detaches the child, and Windows then flashes
+    a command window for one frame. A process with no console still needs
+    that flag and a hidden start-info. ``hide_kwargs`` makes the choice.
+    """
+    if os.name != "nt":
+        return {}
+    try:
+        return _load_console_hide().hide_kwargs({})
+    except Exception:
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        return {
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            "startupinfo": info,
+        }
+
+
 def _own_process_group() -> dict[str, Any]:
-    """Popen kwargs that put native (and any child processes it spawns) in a group we can kill cleanly."""
+    """Popen kwargs that put native (and any child processes it spawns) in a group we can kill cleanly.
+
+    On Windows the group flag alone opens a console, because ``agy`` is a console
+    program and the gateway has none. CREATE_NO_WINDOW plus a hidden start-info
+    keeps that window from flashing. The group flag stays, so the tree can still
+    be killed.
+    """
     if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        return {"creationflags": flags, "startupinfo": info}
     return {"start_new_session": True}
 
 
@@ -59,6 +112,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                **_own_process_group(),
             )
         return
     try:
@@ -151,7 +205,13 @@ def _windows_credential_present() -> bool:
     """
     try:
         # Bytes, not text: cmdkey prints in the console/OEM code page, so nothing is decoded.
-        out = subprocess.run(["cmdkey", "/list:gemini:antigravity"], capture_output=True, timeout=3, check=False)
+        out = subprocess.run(
+            ["cmdkey", "/list:gemini:antigravity"],
+            capture_output=True,
+            timeout=3,
+            check=False,
+            **hidden_console_kwargs(),
+        )
     except (OSError, subprocess.SubprocessError):  # missing cmdkey, TimeoutExpired
         return False
     # Fail closed on a failing cmdkey; the listed target keeps the casing it was stored with.

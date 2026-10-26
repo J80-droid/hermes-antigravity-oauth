@@ -629,6 +629,13 @@ class AntigravityPluginTests(unittest.TestCase):
         # Suffix override: model had -high but effort was set to low
         self.assertEqual(client._resolve_model_and_effort("gemini-3.8-flash-high", "low"), ("gemini-3.8-flash-low", "low"))
 
+        # agy only accepts gemini-4-argon-low/medium/high, never the bare id.
+        self.assertEqual(client._resolve_model_and_effort("gemini-4-argon", "low"), ("gemini-4-argon-low", "low"))
+        self.assertEqual(client._resolve_model_and_effort("gemini-4-argon", "medium"), ("gemini-4-argon-medium", "medium"))
+        self.assertEqual(client._resolve_model_and_effort("gemini-4-argon", "high"), ("gemini-4-argon-high", "high"))
+        self.assertEqual(client._resolve_model_and_effort("gemini-4-argon-high", "low"), ("gemini-4-argon-low", "low"))
+        self.assertIn("gemini-4-argon", _pkg.antigravity_profile.fallback_models)
+
         # Non-gemini model
         # agy rejects --effort for claude-* ("--effort is not supported for model"), so none is sent.
         self.assertEqual(client._resolve_model_and_effort("claude-sonnet-4-6", "high"), ("claude-sonnet-4-6", None))
@@ -1647,11 +1654,28 @@ class AntigravityPluginTests(unittest.TestCase):
             client.close()
             self.assertFalse(Path(temp_dir).exists())
 
+    def test_short_console_programs_stay_hidden_on_windows(self):
+        import process as process_module
+        from process import hidden_console_kwargs
+
+        hide = process_module._load_console_hide()
+        with patch("os.name", "nt"), patch.object(hide, "parent_has_console", return_value=True):
+            flags = hidden_console_kwargs()
+            self.assertEqual(int(flags.get("creationflags") or 0) & 0x08000000, 0)
+        with patch("os.name", "nt"), patch.object(hide, "parent_has_console", return_value=False):
+            flags = hidden_console_kwargs()
+            self.assertEqual(flags["creationflags"] & 0x08000000, 0x08000000)
+            self.assertEqual(flags["startupinfo"].wShowWindow, 0)
+        with patch("os.name", "posix"):
+            self.assertEqual(hidden_console_kwargs(), {})
+
     def test_windows_process_group_creation(self):
         from client import _own_process_group
         with patch("os.name", "nt"):
             flags = _own_process_group()
-            self.assertEqual(flags, {"creationflags": 0x00000200})
+            self.assertEqual(flags["creationflags"] & 0x00000200, 0x00000200)
+            self.assertEqual(flags["creationflags"] & 0x08000000, 0x08000000)
+            self.assertEqual(flags["startupinfo"].wShowWindow, 0)
         with patch("os.name", "posix"):
             flags = _own_process_group()
             self.assertEqual(flags, {"start_new_session": True})
@@ -1664,12 +1688,14 @@ class AntigravityPluginTests(unittest.TestCase):
 
         with patch("os.name", "nt"), patch("subprocess.run") as mock_run:
             _kill_process_tree(mock_proc)
-            mock_run.assert_called_once_with(
-                ["taskkill", "/F", "/T", "/PID", "4321"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            mock_run.assert_called_once()
+            args, kwargs = mock_run.call_args
+            self.assertEqual(args[0], ["taskkill", "/F", "/T", "/PID", "4321"])
+            self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+            self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+            self.assertFalse(kwargs["check"])
+            self.assertEqual(kwargs["creationflags"] & 0x08000000, 0x08000000)
+            self.assertEqual(kwargs["startupinfo"].wShowWindow, 0)
 
     def test_child_env_windows_userprofile(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
