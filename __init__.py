@@ -8,7 +8,6 @@ never reads, copies, or transmits the OAuth token.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import subprocess
 from typing import Any
@@ -149,21 +148,17 @@ class AntigravityOAuthProfile(ProviderProfile):
         return list(_FALLBACK_MODELS)
 
     def get_model_context_length(self, model: str) -> int | None:
-        """Declared context window for Antigravity CLI.
-        
-        Defaults to 200,000 tokens (allowing conversations to comfortably pass
-        140k-160k tokens before auto-compression). Configurable via the
-        ANTIGRAVITY_CONTEXT_LENGTH environment variable.
+        """Context window from the models.dev spec for this model.
+
+        Effort suffixes share the base model's window. An id the catalog does
+        not list returns None, so Hermes keeps resolving instead of substituting
+        one number for every Antigravity model.
         """
-        env_val = os.environ.get("ANTIGRAVITY_CONTEXT_LENGTH")
-        if env_val:
-            try:
-                val = int(env_val.strip())
-                if val > 0:
-                    return val
-            except ValueError:
-                pass
-        return 200_000
+        try:
+            from .context_window import context_length_for
+        except ImportError:
+            from context_window import context_length_for
+        return context_length_for(model)
 
     def classify_api_error(
         self,

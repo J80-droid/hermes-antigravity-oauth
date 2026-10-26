@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import subprocess
@@ -23,6 +24,50 @@ except ImportError:
     import native_tools as _native_tools
 
 logger = logging.getLogger(__name__)
+
+_STDERR_TAIL_CHARS = 4000
+
+
+class _StderrTail:
+    """Keep the tail of a child stderr without letting the pipe fill up.
+
+    The worker used to leave stderr unread, so a full pipe could stall agy
+    and the exit-code error had nothing of agy's own to quote.
+    """
+
+    def __init__(self, stream: Any):
+        self._parts: list[str] = []
+        self._size = 0
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        if not isinstance(stream, io.TextIOBase):
+            return
+
+        def _read() -> None:
+            try:
+                while True:
+                    chunk = stream.read(1024)
+                    if not chunk:
+                        break
+                    with self._lock:
+                        self._parts.append(chunk)
+                        self._size += len(chunk)
+                        while self._size > _STDERR_TAIL_CHARS and len(self._parts) > 1:
+                            self._size -= len(self._parts.pop(0))
+                        if self._size > _STDERR_TAIL_CHARS and self._parts:
+                            self._parts[0] = self._parts[0][-_STDERR_TAIL_CHARS:]
+                            self._size = len(self._parts[0])
+            except Exception:
+                return
+
+        self._thread = threading.Thread(target=_read, name="agy-stderr-tail", daemon=True)
+        self._thread.start()
+
+    def text(self) -> str:
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        with self._lock:
+            return "".join(self._parts)[-_STDERR_TAIL_CHARS:].strip()
 
 
 class _UsageDeltas(NamedTuple):
@@ -498,10 +543,12 @@ class AntigravityStream(Iterator[Any]):
         # agy attempted a native tool invocation (security neutralization)?
         saw_result = False
         neutralized_tool_step = False
+        rejected_tool = "unknown"
         success = False
         start_time = time.monotonic()
 
         gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
+        stderr_tail = _StderrTail(getattr(self.proc, "stderr", None))
         watchdog_stop = threading.Event()
         watchdog_thread: threading.Thread | None = None
 
@@ -577,17 +624,18 @@ class AntigravityStream(Iterator[Any]):
                             self.close()
                             neutralized_tool_step = True
                             break
+                        rejected_tool = str(
+                            step.get("tool_name")
+                            or (step.get("tool_info") or {}).get("name")
+                            or "unknown"
+                        )
                         logger.warning(
                             "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
-                            step.get("tool_name"),
+                            rejected_tool,
                         )
                         self.close()
-                        # Recorded so the post-loop positive-evidence check
-                        # does not treat this security abort as an empty
-                        # failed turn: the process is terminated right here
-                        # on purpose, and the empty completion assembled
-                        # afterwards is the pinned behavior (see
-                        # test_native_tool_step_neutralization_in_stream).
+                        # The kill's exit code is ours. The post-loop names the
+                        # tool and must not report that code as agy's verdict.
                         neutralized_tool_step = True
                         break
                     if "usage" in step:
@@ -710,7 +758,7 @@ class AntigravityStream(Iterator[Any]):
                 except subprocess.TimeoutExpired:
                     self.client._terminate_process(self.proc)
 
-                stderr_out = self.proc.stderr.read() if self.proc.stderr else ""
+                stderr_out = stderr_tail.text()
                 # Raw poll(), NOT `poll() or 0`: a process that is still
                 # alive (None) must stay None. The old coercion fabricated
                 # "exited 0" for it, and the empty-result message then named
@@ -742,6 +790,12 @@ class AntigravityStream(Iterator[Any]):
                 if error_msg or status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
+                if neutralized_tool_step and not has_tool_calls:
+                    raise RuntimeError(
+                        "Antigravity execution failed: "
+                        f"native tool '{rejected_tool}' was stopped before it could run on the host"
+                    )
+
                 # `not in (None, 0)`, not `!= 0`: with the raw poll() above,
                 # None means "still alive", and an alive process that
                 # produced nothing is the empty-result raise's job below,
@@ -761,9 +815,9 @@ class AntigravityStream(Iterator[Any]):
                 # emitting a finish chunk and Hermes then recorded an empty
                 # assistant turn as a legitimate response.
                 #
-                # Success is now REQUIRED to emit finish/usage, the security
-                # neutralization above being the only exception (pinned by
-                # test_native_tool_step_neutralization_in_stream): a partial
+                # Success is now REQUIRED to emit finish/usage. An unmapped native
+                # tool raises earlier and names the tool; a mapped re-issue has
+                # already yielded its Hermes call. A partial
                 # answer with no result event used to slip through on the
                 # strength of its own deltas (saw_result False, has_content
                 # True) and was delivered as a complete stop turn while the
@@ -803,12 +857,20 @@ class AntigravityStream(Iterator[Any]):
                 if error_msg or status == "ERROR":
                     raise RuntimeError(f"Antigravity model error: {error_msg}")
 
+                if neutralized_tool_step and not has_tool_calls:
+                    raise RuntimeError(
+                        "Antigravity execution failed: "
+                        f"native tool '{rejected_tool}' was stopped before it could run on the host"
+                    )
+
                 worker_exit = self.proc.poll()
                 if not has_tool_calls and not has_content and worker_exit not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
-                    raise RuntimeError(f"Antigravity execution failed: worker process exited with return code {worker_exit}")
+                    stderr_out = stderr_tail.text()
+                    detail = stderr_out or f"worker process exited with return code {worker_exit}"
+                    raise RuntimeError(f"Antigravity execution failed: {detail}")
 
                 # Positive-evidence verdict, placed AFTER the quota and
                 # exit-code checks (the more specific signals) and BEFORE the
@@ -831,9 +893,9 @@ class AntigravityStream(Iterator[Any]):
                 # poisoning the respawned worker's deltas. Oneshot streams
                 # carry no baseline at all.
                 #
-                # Success is now REQUIRED to emit finish/usage, the security
-                # neutralization above being the only exception (pinned by
-                # test_native_tool_step_neutralization_in_stream): partial
+                # Success is now REQUIRED to emit finish/usage. An unmapped native
+                # tool raises earlier and names the tool; a mapped re-issue has
+                # already yielded its Hermes call. Partial
                 # deltas with no result event used to slip through on the
                 # strength of their own content (saw_result False,
                 # has_content True), sealing the turn as a complete stop AND

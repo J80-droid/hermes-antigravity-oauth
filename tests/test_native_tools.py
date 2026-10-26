@@ -1,5 +1,6 @@
 """agy-native tool steps become Hermes tool calls; unmappable ones stay neutralized."""
 
+import io
 import json
 import sys
 import tempfile
@@ -44,6 +45,17 @@ class TranslateTests(unittest.TestCase):
         c = native_tools.translate(_step("grep_search", {"Query": "foo", "SearchPath": "/r"}), {"search_files"}, 0)
         self.assertEqual(json.loads(c.function.arguments), {"pattern": "foo", "target": "content", "path": "/r"})
 
+    def test_hermes_read_file_name_is_reissued(self):
+        # agy sometimes emits the Hermes name read_file instead of its own view_file.
+        c = native_tools.translate(_step("read_file", {"path": "/a.py", "offset": 5}), {"read_file"}, 0)
+        self.assertIsNotNone(c)
+        self.assertEqual(c.function.name, "read_file")
+        self.assertEqual(json.loads(c.function.arguments), {"path": "/a.py", "offset": 5})
+        c = native_tools.translate(_step("write_file", {"path": "/a.py", "content": "x"}), {"write_file"}, 1)
+        self.assertEqual(c.function.name, "write_file")
+        c = native_tools.translate(_step("terminal", {"command": "echo hi"}), {"terminal"}, 2)
+        self.assertEqual(json.loads(c.function.arguments)["command"], "echo hi")
+
 
 class StreamBridgeTests(unittest.TestCase):
     def _run(self, events, tools):
@@ -74,10 +86,74 @@ class StreamBridgeTests(unittest.TestCase):
 
     def test_unmappable_native_tool_still_neutralized_without_call(self):
         events = [{"event": "step_update", "step_update": _step("browser_click_element", {"x": 1})}]
-        chunks, term, proc = self._run(events, TERMINAL_TOOL)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        client = AntigravityClient(cwd=tmp.name)
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.stdout.readline.side_effect = [json.dumps(e) + "\n" for e in events] + [""]
+        proc.stdin = MagicMock()
+        proc.stderr = io.StringIO("")
+        with patch("client.is_authenticated", return_value=True), \
+                patch("subprocess.Popen", return_value=proc), \
+                patch.object(client, "_terminate_process") as term:
+            with self.assertRaises(RuntimeError) as caught:
+                list(client.chat.completions.create(
+                    model="claude-sonnet-4-6", tools=TERMINAL_TOOL, stream=True,
+                    messages=[{"role": "user", "content": "run it"}]))
         term.assert_called_once_with(proc)
-        calls = [tc for ch in chunks for tc in (ch.choices[0].delta.tool_calls or [])]
-        self.assertEqual(calls, [])
+        self.assertIn("browser_click_element", str(caught.exception))
+
+    def test_self_killed_native_tool_names_the_tool_not_the_exit_code(self):
+        # taskkill makes poll() return 1. That code is the kill, not agy's verdict.
+        events = [{"event": "step_update", "step_update": _step("browser_click_element", {"x": 1})}]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        client = AntigravityClient(cwd=tmp.name)
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.stdout.readline.side_effect = [json.dumps(e) + "\n" for e in events] + [""]
+        proc.stdin = MagicMock()
+        proc.stderr = io.StringIO("")
+
+        def _kill(p):
+            p.poll.return_value = 1
+
+        with patch("client.is_authenticated", return_value=True), \
+                patch("subprocess.Popen", return_value=proc), \
+                patch.object(client, "_terminate_process", side_effect=_kill):
+            with self.assertRaises(RuntimeError) as caught:
+                list(client.chat.completions.create(
+                    model="gemini-4-argon",
+                    tools=TERMINAL_TOOL,
+                    stream=True,
+                    messages=[{"role": "user", "content": "look"}],
+                ))
+        message = str(caught.exception)
+        self.assertIn("browser_click_element", message)
+        self.assertNotIn("return code", message)
+
+    def test_worker_exit_reports_stderr_tail(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        client = AntigravityClient(cwd=tmp.name)
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        proc.stdout.readline.return_value = ""
+        proc.stdin = MagicMock()
+        proc.stderr = io.StringIO("agy: model gemini-4-argon-high rejected\n")
+        with patch("client.is_authenticated", return_value=True), \
+                patch("subprocess.Popen", return_value=proc), \
+                patch.object(client, "_terminate_process"):
+            with self.assertRaises(RuntimeError) as caught:
+                list(client.chat.completions.create(
+                    model="gemini-4-argon",
+                    stream=True,
+                    messages=[{"role": "user", "content": "look"}],
+                ))
+        message = str(caught.exception)
+        self.assertIn("gemini-4-argon-high rejected", message)
+        self.assertNotIn("return code", message)
 
 
 if __name__ == "__main__":

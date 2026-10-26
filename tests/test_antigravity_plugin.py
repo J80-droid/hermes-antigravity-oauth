@@ -657,14 +657,37 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertNotIn("gemini-3.8-flash-medium", models)
 
     def test_profile_get_model_context_length(self):
-        profile = get_provider_profile("antigravity-oauth")
-        self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 200_000)
-        self.assertEqual(profile.get_model_context_length("gemini-3.1-pro"), 200_000)
-        self.assertEqual(profile.get_model_context_length("claude-sonnet-4-6"), 200_000)
+        from context_window import context_length_for
 
-        # Test env override
-        with patch.dict(os.environ, {"ANTIGRAVITY_CONTEXT_LENGTH": "250000"}):
-            self.assertEqual(profile.get_model_context_length("gemini-3.8-flash"), 250_000)
+        registry = {
+            "google": {"models": {
+                "gemini-4-argon": {"limit": {"context": 1_048_576}},
+                "gemini-3.8-flash": {"limit": {"context": 1_048_576}},
+                "gemini-3-pro-image": {"limit": {"context": 65_536}},
+            }},
+            "anthropic": {"models": {
+                "claude-sonnet-4-6": {"limit": {"context": 1_000_000}},
+            }},
+            "groq": {"models": {
+                "openai/gpt-oss-120b": {"limit": {"context": 131_072}},
+            }},
+            "perplexity-agent": {"models": {
+                "anthropic/claude-sonnet-4-6": {"limit": {"context": 200_000}},
+            }},
+        }
+        self.assertEqual(context_length_for("gemini-4-argon", registry), 1_048_576)
+        self.assertEqual(context_length_for("gemini-4-argon-high", registry), 1_048_576)
+        self.assertEqual(context_length_for("gemini-3.8-flash", registry), 1_048_576)
+        self.assertEqual(context_length_for("gemini-3-pro-image", registry), 65_536)
+        self.assertEqual(context_length_for("claude-sonnet-4-6", registry), 1_000_000)
+        self.assertEqual(context_length_for("gpt-oss-120b-medium", registry), 131_072)
+        self.assertIsNone(context_length_for("not-a-real-model", registry))
+
+        profile = _pkg.antigravity_profile
+        with patch("antigravity_plugin_entry.context_window.load_registry", return_value=registry):
+            self.assertEqual(profile.get_model_context_length("gemini-4-argon"), 1_048_576)
+            self.assertEqual(profile.get_model_context_length("gpt-oss-120b-medium"), 131_072)
+            self.assertIsNone(profile.get_model_context_length("not-a-real-model"))
 
     def test_profile_classify_api_error(self):
         profile = get_provider_profile("antigravity-oauth")
@@ -737,8 +760,10 @@ class AntigravityPluginTests(unittest.TestCase):
                 messages=[{"role": "user", "content": "hi"}],
                 stream=True,
             )
-            chunks = list(stream)
+            with self.assertRaises(RuntimeError) as caught:
+                list(stream)
             mock_term.assert_called_once_with(mock_proc)
+            self.assertIn("run_command", str(caught.exception))
 
     def test_temp_directory_isolation_and_cleanup(self):
         client = AntigravityClient()

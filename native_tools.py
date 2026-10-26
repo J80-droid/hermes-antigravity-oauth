@@ -84,15 +84,22 @@ def _web_extract(p: dict[str, Any]) -> dict[str, Any] | None:
     return {"urls": [str(url)]} if url else None
 
 
-# agy tool name -> (Hermes tool name, argument mapper)
+# agy tool name -> (Hermes tool name, argument mapper).
+# The Hermes names are listed too: after a successful re-issue the transcript
+# shows that name, and the next turn agy emits it as a native step.
 NATIVE_TO_HERMES: dict[str, tuple[str, Mapper]] = {
     "run_command": ("terminal", _terminal),
+    "terminal": ("terminal", _terminal),
     "view_file": ("read_file", _read_file),
+    "read_file": ("read_file", _read_file),
     "write_to_file": ("write_file", _write_file),
+    "write_file": ("write_file", _write_file),
     "grep_search": ("search_files", _search_content),
     "find_by_name": ("search_files", _search_files),
     "search_web": ("web_search", _web_search),
+    "web_search": ("web_search", _web_search),
     "read_url_content": ("web_extract", _web_extract),
+    "web_extract": ("web_extract", _web_extract),
 }
 
 
